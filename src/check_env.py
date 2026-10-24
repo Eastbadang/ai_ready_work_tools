@@ -1,6 +1,6 @@
 """
 AI 모델(LLM 및 이미지 생성 모델) 선정을 위한 크로스 플랫폼 환경 진단 도구
-지원 OS: Windows, macOS, iPadOS(a-Shell/Pythonista), Android(Termux/Pydroid3)
+지원 OS: Windows, macOS, Linux, iOS, iPadOS, Android
 """
 
 import os
@@ -16,38 +16,52 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+
 def detect_os():
-    """운영체제 세부 판별 (Windows, macOS, iPadOS/iOS, Android, Linux)"""
+    """운영체제 세부 판별 (Windows, macOS, Linux, iOS, iPadOS, Android)"""
     sys_name = platform.system().lower()
     
     # 1. Android 확인 (Termux, Pydroid 등)
     if "android" in sys.platform.lower() or os.path.exists("/system/build.prop") or "ANDROID_ROOT" in os.environ:
         return "Android"
     
-    # 2. iPadOS / iOS 확인 (Pythonista, a-Shell, iSH 등)
+    # 2. Apple Darwin 계열 (macOS, iOS, iPadOS)
     if sys_name == "darwin":
-        machine = platform.machine()
-        if "ipad" in machine.lower() or "iphone" in machine.lower():
-            return "iPadOS" if "ipad" in machine.lower() else "iOS"
-        # iSH or sandbox app detection
+        machine = platform.machine().lower()
+        # iOS / iPadOS 디바이스 판별 (Pythonista, a-Shell, iSH 등)
+        if "iphone" in machine:
+            return "iOS"
+        if "ipad" in machine:
+            return "iPadOS"
         if os.path.exists("/private/var/mobile"):
-            return "iPadOS / iOS"
+            # 모바일 샌드박스 내부인 경우
+            return "iOS" if "iphone" in platform.platform().lower() else "iPadOS"
         return "macOS"
     
     # 3. Windows
     if sys_name == "windows":
         return "Windows"
     
-    # 4. 기타 Linux
+    # 4. Linux (배포판 정보 파싱)
     if sys_name == "linux":
-        return "Linux"
+        distro_name = "Linux"
+        if os.path.exists("/etc/os-release"):
+            try:
+                with open("/etc/os-release", "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("PRETTY_NAME="):
+                            distro_name = line.split("=", 1)[1].strip().strip('"')
+                            break
+            except Exception:
+                pass
+        return f"Linux ({distro_name})" if distro_name != "Linux" else "Linux"
         
     return sys_name.capitalize()
 
 
 def get_system_ram_gb():
-    """시스템 RAM(GB) 측정 (OS별 표준 명령 및 /proc 활용)"""
-    # 1. psutil이 있으면 가장 정확
+    """시스템 RAM(GB) 측정 (OS별 API 및 /proc/meminfo 활용)"""
+    # psutil이 설치되어 있는 경우 가장 먼저 확인
     try:
         import psutil
         return round(psutil.virtual_memory().total / (1024 ** 3), 1)
@@ -56,8 +70,8 @@ def get_system_ram_gb():
 
     target_os = detect_os()
 
-    # 2. Windows: ctypes (GlobalMemoryStatusEx)
-    if target_os == "Windows":
+    # 1. Windows: ctypes Windows API (GlobalMemoryStatusEx)
+    if "Windows" in target_os:
         try:
             import ctypes
             class MEMORYSTATUSEX(ctypes.Structure):
@@ -79,15 +93,15 @@ def get_system_ram_gb():
         except Exception:
             pass
 
-    # 3. macOS / iPadOS: sysctl hw.memsize
-    if target_os in ["macOS", "iPadOS", "iOS"]:
+    # 2. macOS / iOS / iPadOS: sysctl hw.memsize
+    if any(k in target_os for k in ["macOS", "iOS", "iPadOS"]):
         try:
             out = subprocess.check_output(["sysctl", "-n", "hw.memsize"]).decode().strip()
             return round(int(out) / (1024 ** 3), 1)
         except Exception:
             pass
 
-    # 4. Android / Linux: /proc/meminfo
+    # 3. Linux / Android: /proc/meminfo
     if os.path.exists("/proc/meminfo"):
         try:
             with open("/proc/meminfo", "r") as f:
@@ -102,24 +116,24 @@ def get_system_ram_gb():
 
 
 def get_gpu_info():
-    """GPU / NPU 및 VRAM 측정 (NVIDIA, Apple Silicon Metal, Vulkan/OpenCL 등)"""
+    """GPU / NPU 및 가용 VRAM 측정 (NVIDIA CUDA, Apple Metal MPS, AMD ROCm, Intel XPU 등)"""
     gpu_list = []
     
-    # 1. PyTorch 기반 가속기 확인 (설치되어 있는 경우)
+    # 1. PyTorch 가속기 확인 (설치되어 있는 경우)
     try:
         import torch
         if torch.cuda.is_available():
+            backend_name = "AMD ROCm" if hasattr(torch.version, "hip") and torch.version.hip else "NVIDIA CUDA"
             for i in range(torch.cuda.device_count()):
                 name = torch.cuda.get_device_name(i)
                 total_mem = round(torch.cuda.get_device_properties(i).total_memory / (1024 ** 3), 1)
                 gpu_list.append({
-                    "type": "NVIDIA CUDA",
+                    "type": backend_name,
                     "name": name,
                     "vram_gb": total_mem,
                     "unified": False
                 })
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            # Apple Silicon Unified Memory
             ram_gb = get_system_ram_gb() or 0
             gpu_list.append({
                 "type": "Apple Silicon (Metal/MPS)",
@@ -127,36 +141,56 @@ def get_gpu_info():
                 "vram_gb": ram_gb,  # 통합 메모리
                 "unified": True
             })
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            for i in range(torch.xpu.device_count()):
+                name = torch.xpu.get_device_name(i)
+                total_mem = round(torch.xpu.get_device_properties(i).total_memory / (1024 ** 3), 1)
+                gpu_list.append({
+                    "type": "Intel XPU (oneAPI/SYCL)",
+                    "name": name,
+                    "vram_gb": total_mem,
+                    "unified": False
+                })
     except ImportError:
         pass
 
-    # PyTorch로 확인되지 않은 경우 OS별 수동 진단
+    # 2. PyTorch가 없거나 감지되지 않은 경우 OS별 수동 진단
     if not gpu_list:
         target_os = detect_os()
         
-        # Windows: nvidia-smi 확인
-        if target_os == "Windows":
+        # Windows / Linux: nvidia-smi CLI
+        if "Windows" in target_os or "Linux" in target_os:
             try:
-                out = subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
-                    creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
-                ).decode().strip()
+                cmd = ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]
+                flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+                out = subprocess.check_output(cmd, creationflags=flags).decode().strip()
                 for line in out.splitlines():
                     parts = [p.strip() for p in line.split(",")]
                     if len(parts) >= 2:
-                        name = parts[0]
-                        vram = round(float(parts[1]) / 1024, 1)
                         gpu_list.append({
                             "type": "NVIDIA GPU",
-                            "name": name,
-                            "vram_gb": vram,
+                            "name": parts[0],
+                            "vram_gb": round(float(parts[1]) / 1024, 1),
                             "unified": False
                         })
             except Exception:
                 pass
                 
+            # Linux: AMD rocm-smi 확인
+            if not gpu_list and "Linux" in target_os:
+                try:
+                    out = subprocess.check_output(["rocm-smi", "--showmeminfo", "vram"]).decode()
+                    gpu_list.append({
+                        "type": "AMD ROCm GPU",
+                        "name": "AMD Radeon / Instinct",
+                        "vram_gb": get_system_ram_gb() or 0,
+                        "unified": False
+                    })
+                except Exception:
+                    pass
+                
         # macOS: system_profiler
-        elif target_os == "macOS":
+        elif "macOS" in target_os:
             try:
                 out = subprocess.check_output(["system_profiler", "SPDisplaysDataType"]).decode()
                 chip_name = "Apple Silicon GPU"
@@ -174,9 +208,19 @@ def get_gpu_info():
             except Exception:
                 pass
                 
-        # Android: Adreno / Mali / Vulkan 확인 시도
-        elif target_os == "Android":
-            gpu_name = "Mobile GPU (Adreno / Mali)"
+        # iOS / iPadOS: Apple Bionic / M-Series GPU (Unified Memory)
+        elif any(k in target_os for k in ["iOS", "iPadOS"]):
+            ram_gb = get_system_ram_gb() or 0
+            gpu_list.append({
+                "type": "Apple Metal GPU (Mobile Unified Memory)",
+                "name": f"Apple A/M Series GPU ({target_os})",
+                "vram_gb": ram_gb,
+                "unified": True
+            })
+
+        # Android: CPU/AP 모델 기반 추론
+        elif "Android" in target_os:
+            gpu_name = "Mobile GPU (Adreno / Mali / Immortalis)"
             if os.path.exists("/proc/cpuinfo"):
                 try:
                     with open("/proc/cpuinfo", "r") as f:
@@ -197,10 +241,10 @@ def get_gpu_info():
 
 
 def recommend_models(os_name, ram_gb, gpus):
-    """하드웨어 스펙 기반 최적 AI 모델(LLM 및 이미지 모델) 추천 매트릭스"""
+    """사양 및 운영체제 특성 기반 최적 AI 모델 제안 매트릭스"""
     vram_gb = gpus[0]["vram_gb"] if gpus else 0
     is_unified = gpus[0]["unified"] if gpus else False
-    is_mobile = os_name in ["Android", "iPadOS", "iOS"]
+    is_mobile = any(k in os_name for k in ["Android", "iPadOS", "iOS"])
 
     recommendations = {
         "recommended_llm": [],
@@ -208,17 +252,50 @@ def recommend_models(os_name, ram_gb, gpus):
         "recommended_engines": []
     }
 
-    # 1. 실행 엔진 추천
-    if os_name == "Windows":
-        recommendations["recommended_engines"] = ["Ollama", "LM Studio", "vLLM (WSL2)", "Diffusers / ComfyUI"]
-    elif os_name == "macOS":
-        recommendations["recommended_engines"] = ["Ollama (Metal)", "LM Studio (Apple Silicon)", "MLX (Apple 공식)", "Draw Things (Metal)"]
-    elif os_name == "iPadOS":
-        recommendations["recommended_engines"] = ["Draw Things (App Store)", "Layla", "Enchanted (Ollama 클라이언트)"]
-    elif os_name == "Android":
-        recommendations["recommended_engines"] = ["Termux + Ollama / llama.cpp", "ChatterUI", "MLC LLM"]
+    # 1. 운영체제별 추천 실행 엔진
+    if "Windows" in os_name:
+        recommendations["recommended_engines"] = [
+            "Ollama (간편한 로컬 LLM CLI/서버)",
+            "LM Studio (사용자 친화적 GUI)",
+            "vLLM (WSL2 고속 서빙)",
+            "ComfyUI / Diffusers (이미지 생성 최적화)"
+        ]
+    elif "Linux" in os_name:
+        recommendations["recommended_engines"] = [
+            "vLLM (초고속 PagedAttention 기반 프로덕션 서빙)",
+            "Ollama (원클릭 설치 및 서빙)",
+            "TGI (Hugging Face Text Generation Inference)",
+            "llama.cpp / Aphrodite Engine",
+            "ComfyUI / Stable Diffusion WebUI (A1111, Forge)"
+        ]
+    elif "macOS" in os_name:
+        recommendations["recommended_engines"] = [
+            "Ollama (Apple Metal GPU 가속)",
+            "LM Studio (Apple Silicon M시리즈 최적화)",
+            "MLX / MLX-LM (애플 공식 고속 프레임워크)",
+            "Draw Things (Metal 기반 고속 이미지 생성 앱)"
+        ]
+    elif "iPadOS" in os_name:
+        recommendations["recommended_engines"] = [
+            "Draw Things (App Store - 로컬 SD/FLUX 생성 앱)",
+            "Layla (온디바이스 LLM 채팅 앱)",
+            "Enchanted / Ollama Hub (Mac/PC 로컬 LLM 연동 클라이언트)"
+        ]
+    elif "iOS" in os_name:
+        recommendations["recommended_engines"] = [
+            "PocketPal AI (iOS 네이티브 온디바이스 LLM)",
+            "Draw Things (아이폰 지원 온디바이스 생성 앱)",
+            "Private LLM (보안 온디바이스 챗봇)",
+            "Enchanted (홈서버 LLM 리모트 챗봇)"
+        ]
+    elif "Android" in os_name:
+        recommendations["recommended_engines"] = [
+            "Termux + Ollama / llama.cpp (안드로이드 리눅스 터미널)",
+            "ChatterUI (GGUF 모델 로컬 로드 앱)",
+            "MLC LLM (Qualcomm Snapdragon NPU/Vulkan 가속)"
+        ]
 
-    # 2. LLM 모델 추천
+    # 2. LLM 모델 크기 및 양자화 추천
     usable_mem = vram_gb if (vram_gb > 0 and not is_unified) else (ram_gb * 0.7 if ram_gb else 4)
 
     if usable_mem >= 24:
@@ -230,16 +307,19 @@ def recommend_models(os_name, ram_gb, gpus):
     elif usable_mem >= 8:
         recommendations["recommended_llm"].append("7B ~ 8B 모델 (Q4/Q5 양자화, 예: Llama 3.1 8B, Qwen 2.5 7B, Gemma 2 9B)")
         recommendations["recommended_llm"].append("3B ~ 4B 모델 (Q8 고정밀도, 예: Llama 3.2 3B, Phi-3.5)")
+    elif usable_mem >= 5:
+        recommendations["recommended_llm"].append("3B ~ 4B 초경량 온디바이스 모델 (Q4 양자화, 예: Llama 3.2 3B, Qwen 2.5 3B)")
+        recommendations["recommended_llm"].append("1B ~ 1.5B 초고속 모델 (예: Qwen 2.5 1.5B, SmolLM2 1.7B)")
     else:
-        recommendations["recommended_llm"].append("1B ~ 3B 초경량 온디바이스 모델 (Q4 양자화, 예: Llama 3.2 1B/3B, Qwen 2.5 1.5B/3B, SmolLM2)")
+        recommendations["recommended_llm"].append("1B 미만 ~ 1.5B 모바일 초경량 모델 (Q4, 예: SmolLM2 360M/1.7B, Qwen 2.5 0.5B/1.5B)")
 
-    # 3. 이미지 생성 (Diffusion) 모델 추천
+    # 3. 이미지 생성 (Diffusion / FLUX) 모델 추천
     if is_mobile:
         if usable_mem >= 6:
-            recommendations["recommended_diffusion"].append("SD 1.5 기반 경량 모델 (Draw Things / Mobile App)")
-            recommendations["recommended_diffusion"].append("SDXL-Turbo / LCM (저스텝 4~8스텝 실시간 생성)")
+            recommendations["recommended_diffusion"].append("SD 1.5 기반 경량 체크포인트 (Draw Things 앱으로 512x512 생성)")
+            recommendations["recommended_diffusion"].append("SDXL-Turbo / LCM (4~8스텝 실시간 생성)")
         else:
-            recommendations["recommended_diffusion"].append("모바일 VRAM 제약으로 온디바이스 고화질 생성은 제한적 (Cloud API 권장)")
+            recommendations["recommended_diffusion"].append("스마트폰/태블릿 메모리 제약으로 로컬 생성보다는 Cloud API 권장")
     else:
         if vram_gb >= 16 or (is_unified and ram_gb >= 32):
             recommendations["recommended_diffusion"].append("FLUX.1 [dev] / FLUX.2 Klein (1024x1024 ~ 1536x1536 고화질)")
@@ -274,7 +354,7 @@ def format_markdown_report(os_name, ram_gb, gpus, recs):
 
     md = f"""# 🔍 AI 모델 구동 환경 진단 보고서
 
-> 생성 일시: 시스템 로컬 타임 기준 자동 생성
+> 지원 플랫폼: Windows, macOS, Linux, iOS, iPadOS, Android
 
 ## 1. 하드웨어 및 시스템 사양
 - **운영체제(OS)**: `{os_name}` ({platform.platform()})
@@ -299,7 +379,7 @@ def format_markdown_report(os_name, ram_gb, gpus, recs):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="AI 모델 구동 환경 진단 및 파일 저장 도구")
+    parser = argparse.ArgumentParser(description="AI 모델 구동 환경 진단 및 파일 저장 도구 (Windows/macOS/Linux/iOS/iPadOS/Android)")
     parser.add_argument("--output", "-o", type=str, default="ai_env_report.md", help="저장할 파일 경로 (.md 또는 .txt)")
     parser.add_argument("--no-save", action="store_true", help="파일 저장 없이 콘솔에만 출력")
     args = parser.parse_args()
