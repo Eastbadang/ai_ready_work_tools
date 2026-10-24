@@ -36,3 +36,7 @@
 ### 1. 기본 실행 (진단 + 마크다운 보고서 생성)
 ```bash
 python check_env.py
+
+
+## 📜 라이선스 (License)
+이 스크립트는 오픈소스이며 자유롭게 수정 및 배포가 가능합니다 (MIT License).
